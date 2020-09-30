@@ -201,7 +201,7 @@ func (eb *ethBroadcaster) processUnstartedEthTxs(fromAddress gethCommon.Address)
 			return errors.Wrap(err, "processUnstartedEthTxs failed")
 		}
 
-		if err := eb.handleInProgressEthTx(*etx, a, true); err != nil {
+		if err := eb.handleInProgressEthTx(*etx, a, time.Now()); err != nil {
 			return errors.Wrap(err, "processUnstartedEthTxs failed")
 		}
 	}
@@ -215,7 +215,7 @@ func (eb *ethBroadcaster) handleAnyInProgressEthTx(fromAddress gethCommon.Addres
 		return errors.Wrap(err, "handleAnyInProgressEthTx failed")
 	}
 	if etx != nil {
-		if err := eb.handleInProgressEthTx(*etx, etx.EthTxAttempts[0], false); err != nil {
+		if err := eb.handleInProgressEthTx(*etx, etx.EthTxAttempts[0], etx.CreatedAt); err != nil {
 			return errors.Wrap(err, "handleAnyInProgressEthTx failed")
 		}
 	}
@@ -241,18 +241,9 @@ func getInProgressEthTx(store *store.Store, fromAddress gethCommon.Address) (*mo
 
 // There can be at most one in_progress transaction per address.
 // Here we complete the job that we didn't finish last time.
-func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models.EthTxAttempt, isVirginTransaction bool) error {
+func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models.EthTxAttempt, initialBroadcastAt time.Time) error {
 	if etx.State != models.EthTxInProgress {
 		return errors.Errorf("invariant violation: expected transaction %v to be in_progress, it was %s", etx.ID, etx.State)
-	}
-
-	var broadcastAt time.Time
-	if isVirginTransaction {
-		broadcastAt = time.Now()
-	} else {
-		// If not new, we tried to send this before.
-		// It may have already been sent, so we should use the earlist known time which is created_at
-		broadcastAt = etx.CreatedAt
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), maxEthNodeRequestTime)
@@ -265,40 +256,58 @@ func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models
 		return saveFatallyErroredTransaction(eb.store, &etx)
 	}
 
-	etx.BroadcastAt = &broadcastAt
+	etx.BroadcastAt = &initialBroadcastAt
 
-	if sendError.IsNonceTooLowError() || sendError.IsReplacementUnderpriced() {
-		if isVirginTransaction {
-			// If we get this error, and transaction has never been processed
-			// before, it is extremely likely that an external wallet messed with
-			// our nonce and we have no choice but to send it again.
-			//
-			// On the off chance an external wallet did not do this and we
-			// somehow got a network double-send or something, this fails by
-			// sending the transction twice (one will revert) which is a safe
-			// fail case.
-			return eb.handleExternalWalletUsedNonce(&etx, attempt)
-		}
-		// If this is resuming a previous crashed run, it is likely that our
-		// previous transaction was the one who was confirmed, in which case
-		// we hand it off to the eth confirmer to get the receipt.
+	if sendError.IsNonceTooLowError() {
+		// There are three scenarios that this can happen:
 		//
-		// It is however possible an external wallet can have messed with the
-		// account during restart.
+		// SCENARIO 1
+		//
+		// This is resuming a previous crashed run. In this scenario, it is
+		// likely that our previous transaction was the one who was confirmed,
+		// in which case we hand it off to the eth confirmer to get the
+		// receipt.
+		//
+		// SCENARIO 2
+		//
+		// It is also possible that an external wallet can have messed with the
+		// account and sent a transaction on this nonce.
 		//
 		// In this case, the onus is on the node operator since this is
 		// explicitly unsupported.
 		//
-		// If it turns out to have been an external wallet, this transaction
-		// will be retried on every new head (and will fail) until we reach out
-		// block depth target and then abandoned.
+		// If it turns out to have been an external wallet, we will never get a
+		// receipt for this transaction and it will eventually be marked as
+		// errored.
 		//
-		// Assume success and hand off to the ethConfirmer.
+		// The end result is that we will NOT SEND a transaction for this
+		// nonce.
+		//
+		// SCENARIO 3
+		//
+		// The network/eth client can be assumed to have at-least-once delivery
+		// behaviour. It is possible that the eth client could have already
+		// sent this exact same transaction even if this is our first time
+		// calling SendTransaction().
+		//
+		// In all scenarios, the correct thing to do is assume success for now
+		// and hand off to the eth confirmer to get the receipt (or mark as
+		// failed).
 		sendError = nil
 	}
 
+	if sendError.IsReplacementUnderpriced() {
+		// The only way we can have a replacement underpriced error is if we
+		// tried to submit a DIFFERENT transaction at this nonce than the one
+		// the remote node already has in its mempool (with an insufficiently
+		// increased gas price).
+		//
+		// The only way this can happen is if an external wallet used the account.
+		return eb.handleExternalWalletUsedNonce(&etx, attempt)
+	}
+
 	if sendError.IsTerminallyUnderpriced() {
-		return eb.tryAgainWithHigherGasPrice(sendError, etx, attempt, isVirginTransaction)
+		return eb.tryAgainWithHigherGasPrice(sendError, etx, attempt, initialBroadcastAt)
 	}
 
 	if sendError.IsTemporarilyUnderpriced() {
@@ -323,12 +332,12 @@ func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models
 // If this has been used by another wallet we must nonetheless keep
 // broadcasting because we have to ensure the nonce gets filled.  If the
 // external wallet's transaction is reorged out we can end up with a gap in the
-// nonce sequence.  AT ALL COSTS we must have a locally gapless and monotonically
+// nonce sequence. AT ALL COSTS we must have a locally gapless and monotonically
 // increasing nonce sequence.
 func (eb *ethBroadcaster) handleExternalWalletUsedNonce(etx *models.EthTx, attempt models.EthTxAttempt) error {
 	logger.Errorf("nonce of %v was too low for eth_tx %v. Address %s has been used by another wallet. "+
-		"This is NOT SUPPORTED by chainlink and can lead to lost or reverted transactions. "+
-		"Will create a duplicate eth_tx and attempt to resend at a higher nonce...",
+		"This is NOT SUPPORTED by chainlink and WILL lead to lost or reverted transactions. "+
+		"Creating duplicate eth_tx and will attempt to resend at a higher nonce.",
 		*etx.Nonce, etx.ID, etx.FromAddress.String())
 
 	clonedEtx := cloneForRebroadcast(etx)
@@ -417,7 +426,7 @@ func saveUnconfirmed(store *store.Store, etx *models.EthTx, attempt models.EthTx
 	})
 }
 
-func (eb *ethBroadcaster) tryAgainWithHigherGasPrice(sendError *sendError, etx models.EthTx, attempt models.EthTxAttempt, isVirginTransaction bool) error {
+func (eb *ethBroadcaster) tryAgainWithHigherGasPrice(sendError *sendError, etx models.EthTx, attempt models.EthTxAttempt, initialBroadcastAt time.Time) error {
 	bumpedGasPrice, err := BumpGas(eb.config, attempt.GasPrice.ToInt())
 	if err != nil {
 		return errors.Wrap(err, "tryAgainWithHigherGasPrice failed")
@@ -437,7 +446,7 @@ func (eb *ethBroadcaster) tryAgainWithHigherGasPrice(sendError *sendError, etx m
 	if err := saveReplacementInProgressAttempt(eb.store, attempt, &replacementAttempt); err != nil {
 		return errors.Wrap(err, "tryAgainWithHigherGasPrice failed")
 	}
-	return eb.handleInProgressEthTx(etx, replacementAttempt, isVirginTransaction)
+	return eb.handleInProgressEthTx(etx, replacementAttempt, initialBroadcastAt)
 }
 
 func saveFatallyErroredTransaction(store *store.Store, etx *models.EthTx) error {

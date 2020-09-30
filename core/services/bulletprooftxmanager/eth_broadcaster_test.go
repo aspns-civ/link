@@ -731,7 +731,7 @@ func TestEthBroadcaster_ProcessUnstartedEthTxs_Errors(t *testing.T) {
 
 	eb := bulletprooftxmanager.NewEthBroadcaster(store, config)
 
-	t.Run("external wallet sent a transaction from the account and now the nonce is one higher than it should be", func(t *testing.T) {
+	t.Run("if external wallet sent a transaction from the account and now the nonce is one higher than it should be and we got replacement underpriced", func(t *testing.T) {
 		localNextNonce := getLocalNextNonce(t, store, defaultFromAddress)
 		require.Equal(t, 0, int(localNextNonce))
 		remoteNextNonce := uint64(1)
@@ -752,10 +752,10 @@ func TestEthBroadcaster_ProcessUnstartedEthTxs_Errors(t *testing.T) {
 		}
 		require.NoError(t, store.DB.Save(&ethTaskRunTx).Error)
 
-		// First send, nonce too low
+		// First send, replacement underpriced
 		ethClient.On("SendTransaction", mock.Anything, mock.MatchedBy(func(tx *gethTypes.Transaction) bool {
 			return tx.Nonce() == localNextNonce
-		})).Return(errors.New("nonce too low")).Once()
+		})).Return(errors.New("replacement transaction underpriced")).Once()
 
 		// Second send with higher nonce
 		ethClient.On("SendTransaction", mock.Anything, mock.MatchedBy(func(tx *gethTypes.Transaction) bool {
