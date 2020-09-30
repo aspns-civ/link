@@ -874,7 +874,7 @@ func TestEthConfirmer_BumpGasWhereNecessary(t *testing.T) {
 	attempt2_2.BroadcastBeforeBlockNum = &oldEnough
 	require.NoError(t, store.DB.Save(&attempt2_2).Error)
 
-	t.Run("handles case where nonce is too low but receipt is nil indicating that an external wallet used the nonce (until finalized)", func(t *testing.T) {
+	t.Run("assumes that 'nonce too low' error means success", func(t *testing.T) {
 		expectedBumpedGasPrice := big.NewInt(30000000000)
 		require.Greater(t, expectedBumpedGasPrice.Int64(), attempt2_1.GasPrice.ToInt().Int64())
 
@@ -889,10 +889,10 @@ func TestEthConfirmer_BumpGasWhereNecessary(t *testing.T) {
 				ethTx = *tx
 				return true
 			}),
-			mock.Anything).Return(&ethTx, nil).Twice()
+			mock.Anything).Return(&ethTx, nil).Once()
 		ethClient.On("SendTransaction", mock.Anything, mock.MatchedBy(func(tx *gethTypes.Transaction) bool {
 			return int64(tx.Nonce()) == n && expectedBumpedGasPrice.Cmp(tx.GasPrice()) == 0
-		})).Return(errors.New("nonce too low")).Twice()
+		})).Return(errors.New("nonce too low")).Once()
 
 		// Creates new attempt as normal if currentHead is not high enough
 		require.NoError(t, ec.BumpGasWhereNecessary(context.TODO(), keys, currentHead))
@@ -905,18 +905,6 @@ func TestEthConfirmer_BumpGasWhereNecessary(t *testing.T) {
 		assert.Equal(t, models.EthTxAttemptBroadcast, etx2.EthTxAttempts[0].State)
 		assert.Equal(t, models.EthTxAttemptBroadcast, etx2.EthTxAttempts[1].State)
 		assert.Equal(t, models.EthTxAttemptBroadcast, etx2.EthTxAttempts[2].State)
-
-		// When currentHead is above the threshold, we save it as failed
-		require.NoError(t, ec.BumpGasWhereNecessary(context.TODO(), keys, currentHead+100))
-
-		etx2, err = store.FindEthTxWithAttempts(etx2.ID)
-		require.NoError(t, err)
-		assert.Equal(t, models.EthTxFatalError, etx2.State)
-
-		// No new attempts saved
-		require.Len(t, etx2.EthTxAttempts, 2)
-		assert.Equal(t, models.EthTxAttemptBroadcast, etx2.EthTxAttempts[0].State)
-		assert.Equal(t, models.EthTxAttemptBroadcast, etx2.EthTxAttempts[1].State)
 
 		ethClient.AssertExpectations(t)
 		kst.AssertExpectations(t)
